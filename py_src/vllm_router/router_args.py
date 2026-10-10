@@ -16,6 +16,7 @@ class RouterArgs:
     # PD-specific configuration
     mini_lb: bool = False
     vllm_pd_disaggregation: bool = False  # Enable vLLM PD disaggregated mode
+    encoder_only_prefill: bool = False
     prefill_urls: List[tuple] = dataclasses.field(
         default_factory=list
     )  # List of (url, bootstrap_port)
@@ -36,9 +37,7 @@ class RouterArgs:
     wasm_middleware: Optional[str] = None
     wasm_middleware_sha256: Optional[str] = None
     wasm_middleware_routes: List[str] = dataclasses.field(default_factory=list)
-    intra_node_data_parallel_size: int = (
-        1  # Intra-node data parallel size (DP-aware routing automatically enabled when > 1)
-    )
+    intra_node_data_parallel_size: int = 1  # Intra-node data parallel size (DP-aware routing automatically enabled when > 1)
     enable_igw: bool = False  # Enable IGW (Inter-Gateway) mode for multi-model support
     api_key: Optional[str] = None
     log_dir: Optional[str] = None
@@ -200,6 +199,12 @@ class RouterArgs:
             f"--{prefix}vllm-pd-disaggregation",
             action="store_true",
             help="Enable vLLM PD (Prefill-Decode) disaggregated mode",
+        )
+        parser.add_argument(
+            f"--{prefix}encoder-only-prefill",
+            action="store_true",
+            help="Run Mooncake Prefill in cache-only mode concurrently with Decode. "
+            "Requires static Prefill/Decode URLs and explicit bootstrap ports.",
         )
         parser.add_argument(
             f"--{prefix}prefill",
@@ -566,6 +571,30 @@ class RouterArgs:
         if self.wasm_middleware_sha256 and not self.wasm_middleware:
             raise ValueError("wasm_middleware_sha256 requires wasm_middleware")
 
+        if self.encoder_only_prefill:
+            if not self.vllm_pd_disaggregation:
+                raise ValueError(
+                    "--encoder-only-prefill requires --vllm-pd-disaggregation"
+                )
+            if self.mini_lb:
+                raise ValueError("--encoder-only-prefill requires the Rust router")
+            if self.kv_connector != "mooncake":
+                raise ValueError(
+                    "--encoder-only-prefill requires --kv-connector mooncake"
+                )
+            if self.service_discovery or self.vllm_discovery_address:
+                raise ValueError(
+                    "--encoder-only-prefill currently requires explicit static URLs"
+                )
+            if not self.prefill_urls or not self.decode_urls:
+                raise ValueError(
+                    "--encoder-only-prefill requires static Prefill and Decode URLs"
+                )
+            if any(port is None for _, port in self.prefill_urls):
+                raise ValueError(
+                    "--encoder-only-prefill requires a bootstrap port for every Prefill URL"
+                )
+
         # Validate configuration based on mode
         if self.vllm_pd_disaggregation:
             # Validate PD configuration - skip URL requirements if using service discovery
@@ -619,7 +648,6 @@ class RouterArgs:
 
         prefill_urls = []
         for prefill_args in prefill_list:
-
             url = prefill_args[0]
 
             # Handle optional bootstrap port

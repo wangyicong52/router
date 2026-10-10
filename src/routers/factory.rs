@@ -1,7 +1,11 @@
 //! Factory for creating router instances
 
 use super::{
-    http::{openai_router::OpenAIRouter, router::Router, vllm_pd_router::VllmPDRouter},
+    http::{
+        openai_router::OpenAIRouter,
+        router::Router,
+        vllm_pd_router::{VllmPDRouter, VllmPDRouterOptions},
+    },
     RouterTrait,
 };
 use crate::config::{PolicyConfig, RoutingMode};
@@ -15,6 +19,14 @@ pub struct RouterFactory;
 impl RouterFactory {
     /// Create a router instance from application context
     pub async fn create_router(ctx: &Arc<AppContext>) -> Result<Box<dyn RouterTrait>, String> {
+        Self::create_router_with_options(ctx, VllmPDRouterOptions::default()).await
+    }
+
+    /// Create a router instance with optional vLLM P/D behavior.
+    pub async fn create_router_with_options(
+        ctx: &Arc<AppContext>,
+        vllm_pd_options: VllmPDRouterOptions,
+    ) -> Result<Box<dyn RouterTrait>, String> {
         match &ctx.router_config.mode {
             RoutingMode::Regular { worker_urls } => {
                 Self::create_regular_router(worker_urls, ctx).await
@@ -28,13 +40,14 @@ impl RouterFactory {
             } => {
                 tracing::info!("Creating VllmPDRouter with prefill_urls: {:?}, decode_urls: {:?}, discovery: {:?}",
                               prefill_urls, decode_urls, discovery_address);
-                Self::create_vllm_pd_router(
+                Self::create_vllm_pd_router_with_options(
                     prefill_urls,
                     decode_urls,
                     discovery_address.clone(),
                     prefill_policy.as_ref(),
                     decode_policy.as_ref(),
                     &ctx.router_config.policy,
+                    vllm_pd_options,
                     ctx,
                 )
                 .await
@@ -66,6 +79,31 @@ impl RouterFactory {
         main_policy_config: &PolicyConfig,
         ctx: &Arc<AppContext>,
     ) -> Result<Box<dyn RouterTrait>, String> {
+        Self::create_vllm_pd_router_with_options(
+            prefill_urls,
+            decode_urls,
+            discovery_address,
+            prefill_policy_config,
+            decode_policy_config,
+            main_policy_config,
+            VllmPDRouterOptions::default(),
+            ctx,
+        )
+        .await
+    }
+
+    /// Create a vLLM P/D router with optional behavior.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn create_vllm_pd_router_with_options(
+        prefill_urls: &[(String, Option<u16>)],
+        decode_urls: &[String],
+        discovery_address: Option<String>,
+        prefill_policy_config: Option<&PolicyConfig>,
+        decode_policy_config: Option<&PolicyConfig>,
+        main_policy_config: &PolicyConfig,
+        options: VllmPDRouterOptions,
+        ctx: &Arc<AppContext>,
+    ) -> Result<Box<dyn RouterTrait>, String> {
         // Initialize policies in PolicyRegistry - use specific policies if provided, otherwise fall back to main policy
         let prefill_policy =
             PolicyFactory::create_from_config(prefill_policy_config.unwrap_or(main_policy_config));
@@ -91,10 +129,11 @@ impl RouterFactory {
             );
         }
 
-        let router = VllmPDRouter::new(
+        let router = VllmPDRouter::new_with_options(
             prefill_urls.to_vec(),
             decode_urls.to_vec(),
             discovery_address,
+            options,
             ctx,
         )
         .await?;

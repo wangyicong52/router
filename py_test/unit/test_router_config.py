@@ -53,6 +53,49 @@ class TestRouterConfigValidation:
         assert args.decode_urls == ["http://decode1:8001", "http://decode2:8001"]
         assert args.policy == "cache_aware"
 
+    def test_valid_encoder_only_prefill_config(self):
+        args = RouterArgs(
+            vllm_pd_disaggregation=True,
+            encoder_only_prefill=True,
+            kv_connector="mooncake",
+            prefill_urls=[("http://prefill1:8000", 8998)],
+            decode_urls=["http://decode1:8001"],
+        )
+
+        args._validate_router_args()
+
+    @pytest.mark.parametrize(
+        ("overrides", "message"),
+        [
+            (
+                {"vllm_pd_disaggregation": False},
+                "requires --vllm-pd-disaggregation",
+            ),
+            ({"kv_connector": "nixl"}, "requires --kv-connector mooncake"),
+            (
+                {"service_discovery": True},
+                "requires explicit static URLs",
+            ),
+            (
+                {"prefill_urls": [("http://prefill1:8000", None)]},
+                "requires a bootstrap port",
+            ),
+        ],
+    )
+    def test_invalid_encoder_only_prefill_config(self, overrides, message):
+        values = {
+            "vllm_pd_disaggregation": True,
+            "encoder_only_prefill": True,
+            "kv_connector": "mooncake",
+            "prefill_urls": [("http://prefill1:8000", 8998)],
+            "decode_urls": ["http://decode1:8001"],
+        }
+        values.update(overrides)
+        args = RouterArgs(**values)
+
+        with pytest.raises(ValueError, match=message):
+            args._validate_router_args()
+
     def test_pd_config_without_urls_raises_error(self):
         """Test that PD mode without URLs raises validation error."""
         args = RouterArgs(

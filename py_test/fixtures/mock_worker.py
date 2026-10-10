@@ -62,6 +62,7 @@ def create_app(args: argparse.Namespace) -> FastAPI:
     worker_id = _extract_worker_id(args)
     start_ts = time.time()
     crashed = {"done": False}
+    last_request = {"count": 0, "json": None, "headers": {}}
 
     async def maybe_delay():
         if args.latency_ms > 0:
@@ -125,6 +126,19 @@ def create_app(args: argparse.Namespace) -> FastAPI:
     async def list_models():
         return JSONResponse({"data": [{"id": "mock", "object": "model"}]})
 
+    @app.get("/query")
+    async def mooncake_bootstrap_query():
+        return JSONResponse(
+            {
+                str(rank): {"engine_id": f"{worker_id}-engine-{rank}"}
+                for rank in range(args.dp_size)
+            }
+        )
+
+    @app.get("/last_request")
+    async def get_last_request():
+        return JSONResponse(last_request)
+
     @app.get("/get_server_info")
     async def get_server_info(request: Request):
         # Enforce API key on server info when required (used by router for worker discovery)
@@ -180,10 +194,13 @@ def create_app(args: argparse.Namespace) -> FastAPI:
             data = await request.json()
         except (json.JSONDecodeError, ValueError):
             data = {}
+        last_request["count"] += 1
+        last_request["json"] = data
+        last_request["headers"] = dict(request.headers)
 
         now = time.time()
         ret = {
-            "id": f"cmpl-{int(now*1000)}",
+            "id": f"cmpl-{int(now * 1000)}",
             "object": "text_completion",
             "created": int(now),
             "model": "mock",
@@ -208,6 +225,13 @@ def create_app(args: argparse.Namespace) -> FastAPI:
 
     async def handle_stream_request(request: Request):
         check_api_key(request)
+        try:
+            data = await request.json()
+        except (json.JSONDecodeError, ValueError):
+            data = {}
+        last_request["count"] += 1
+        last_request["json"] = data
+        last_request["headers"] = dict(request.headers)
 
         async def gen():
             # minimal 2-chunk stream then [DONE]

@@ -25,6 +25,7 @@ class TestRouterArgs:
         assert args.policy == "cache_aware"
         assert args.worker_urls == []
         assert args.vllm_pd_disaggregation is False
+        assert args.encoder_only_prefill is False
         assert args.prefill_urls == []
         assert args.decode_urls == []
         assert args.enable_program_scheduling is False
@@ -136,6 +137,27 @@ class TestRouterArgs:
         # Test None
         result = RouterArgs._parse_decode_urls(None)
         assert result == []
+
+    def test_parse_encoder_only_prefill(self):
+        args = parse_router_args(
+            [
+                "--vllm-pd-disaggregation",
+                "--encoder-only-prefill",
+                "--kv-connector",
+                "mooncake",
+                "--prefill",
+                "http://prefill:8000",
+                "8998",
+                "--decode",
+                "http://decode:8001",
+            ]
+        )
+
+        assert args.vllm_pd_disaggregation is True
+        assert args.encoder_only_prefill is True
+        assert args.kv_connector == "mooncake"
+        assert args.prefill_urls == [("http://prefill:8000", 8998)]
+        assert args.decode_urls == ["http://decode:8001"]
 
     def test_from_cli_args_basic(self):
         """Test creating RouterArgs from basic CLI arguments."""

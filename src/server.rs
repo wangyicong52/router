@@ -14,6 +14,7 @@ use crate::{
         worker_spec::{WorkerApiResponse, WorkerConfigRequest, WorkerErrorResponse},
     },
     routers::{
+        http::vllm_pd_router::VllmPDRouterOptions,
         router_manager::{RouterId, RouterManager},
         RouterFactory, RouterTrait,
     },
@@ -863,6 +864,15 @@ pub fn build_app_with_wasm_middleware(
 }
 
 pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Error>> {
+    startup_with_options(config, VllmPDRouterOptions::default()).await
+}
+
+/// Start the server with optional vLLM P/D behavior while preserving the
+/// original `startup` API.
+pub async fn startup_with_options(
+    config: ServerConfig,
+    vllm_pd_options: VllmPDRouterOptions,
+) -> Result<(), Box<dyn std::error::Error>> {
     println!("DEBUG: Server startup function called");
 
     // Only initialize logging if not already done (for Python bindings support)
@@ -977,13 +987,14 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
             }
 
             // 2. HTTP vLLM PD Router
-            match RouterFactory::create_vllm_pd_router(
+            match RouterFactory::create_vllm_pd_router_with_options(
                 &[],
                 &[],
                 None,
                 None,
                 None,
                 &config.router_config.policy,
+                vllm_pd_options,
                 &app_context,
             )
             .await
@@ -1010,7 +1021,10 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
             info!("Single router mode (enable_igw=false)");
             // Create single router with the context
             (
-                Arc::from(RouterFactory::create_router(&app_context).await?),
+                Arc::from(
+                    RouterFactory::create_router_with_options(&app_context, vllm_pd_options)
+                        .await?,
+                ),
                 None,
             )
         };

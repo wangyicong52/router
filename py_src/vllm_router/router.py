@@ -69,6 +69,8 @@ class Router:
         prometheus_port: Port to expose Prometheus metrics. Default: None
         prometheus_host: Host address to bind the Prometheus metrics server. Default: None
         vllm_pd_disaggregation: Enable vLLM PD (Prefill-Decode) disaggregated mode. Default: False
+        encoder_only_prefill: Run Mooncake Prefill in cache-only mode concurrently with Decode.
+            Requires static Prefill/Decode URLs and explicit Prefill bootstrap ports. Default: False
         prefill_urls: List of (url, bootstrap_port) tuples for prefill servers (PD mode only)
         decode_urls: List of URLs for decode servers (PD mode only)
         prefill_policy: Specific load balancing policy for prefill nodes (PD mode only).

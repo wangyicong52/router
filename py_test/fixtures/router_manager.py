@@ -91,6 +91,8 @@ class RouterManager:
                 "max_payload_size": "--max-payload-size",
                 "intra_node_data_parallel_size": "--intra-node-data-parallel-size",
                 "api_key": "--api-key",
+                "kv_connector": "--kv-connector",
+                "encoder_only_prefill": "--encoder-only-prefill",
                 # Health/monitoring
                 "worker_startup_check_interval": "--worker-startup-check-interval",
                 "worker_startup_timeout_secs": "--worker-startup-timeout-secs",

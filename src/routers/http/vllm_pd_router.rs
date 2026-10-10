@@ -35,6 +35,16 @@ struct MooncakePrefillInfo {
     dp_engine_ids: HashMap<usize, String>,
 }
 
+/// Optional behavior for the vLLM P/D router.
+///
+/// This stays separate from `RouterConfig` so existing Rust callers using
+/// exhaustive public struct literals remain source-compatible.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct VllmPDRouterOptions {
+    /// Run Mooncake Prefill in cache-only mode concurrently with Decode.
+    pub encoder_only_prefill: bool,
+}
+
 /// vLLM PD Router that extends PdRouterBase with vLLM-specific request handling
 #[derive(Debug)]
 pub struct VllmPDRouter {
@@ -60,6 +70,8 @@ pub struct VllmPDRouter {
     prefill_dp_round_robin: Arc<AtomicUsize>,
     /// KV connector type
     kv_connector: KvConnector,
+    /// Whether Mooncake Prefill only populates remote KV for Decode.
+    encoder_only_prefill: bool,
     /// Mooncake bootstrap info: prefill base_url -> MooncakePrefillInfo
     mooncake_prefill_info: Arc<Mutex<HashMap<String, MooncakePrefillInfo>>>,
     /// NIXL push identity per prefill base_url and dp_rank; never held across an await.
@@ -75,6 +87,18 @@ const MORIIO_TRANSFER_PREFIX: &str = "tx";
 /// reports success before a discovered prefill/decode pair can serve requests.
 fn discovery_is_ready(prefill_count: usize, decode_count: usize) -> bool {
     prefill_count > 0 && decode_count > 0
+}
+
+fn mooncake_prefill_params(transfer_id: Option<&str>, encoder_only_prefill: bool) -> Value {
+    let mut params = json!({
+        "do_remote_decode": true,
+        "do_remote_prefill": false,
+        "transfer_id": transfer_id.unwrap_or(""),
+    });
+    if encoder_only_prefill {
+        params["cache_only"] = json!(true);
+    }
+    params
 }
 
 /// Build a prefill reqwest::RequestBuilder with the standard headers and dp-rank header.
@@ -203,11 +227,10 @@ impl VllmPDRouter {
         decode_dp_rank: Option<usize>,
     ) -> Result<Value, String> {
         match self.kv_connector {
-            KvConnector::Mooncake => Ok(json!({
-                "do_remote_decode": true,
-                "do_remote_prefill": false,
-                "transfer_id": transfer_id.unwrap_or(""),
-            })),
+            KvConnector::Mooncake => Ok(mooncake_prefill_params(
+                transfer_id,
+                self.encoder_only_prefill,
+            )),
             KvConnector::MoriIO => {
                 let mode = self.moriio_transfer_mode().ok_or_else(|| {
                     "No MoRI-IO instances have registered a transfer mode; \
@@ -1300,7 +1323,7 @@ impl VllmPDRouter {
 
         if let Some((prefill_request, decode_request, request_id)) = self
             .try_build_concurrent_requests(&original_request, &prefill_worker, &decode_worker, path)
-            .await
+            .await?
         {
             return self
                 .process_concurrent_two_stage(
@@ -1718,14 +1741,73 @@ impl VllmPDRouter {
         prefill_worker: &Arc<dyn Worker>,
         decode_worker: &Arc<dyn Worker>,
         path: &str,
-    ) -> Option<(Value, Value, String)> {
+    ) -> Result<Option<(Value, Value, String)>, PDRouterError> {
+        if self.encoder_only_prefill {
+            let prefill_base_url = prefill_worker.base_url().to_string();
+            let prefill_dp_rank = prefill_worker.dp_rank().unwrap_or(0);
+            let (bootstrap_addr, engine_id) = {
+                let info = self.mooncake_prefill_info.lock().await;
+                let prefill_info = info.get(&prefill_base_url).ok_or_else(|| {
+                    PDRouterError::InvalidConfiguration {
+                        reason: format!(
+                            "Missing Mooncake bootstrap info for encoder-only Prefill {}",
+                            prefill_base_url
+                        ),
+                    }
+                })?;
+                let engine_id = prefill_info
+                    .dp_engine_ids
+                    .get(&prefill_dp_rank)
+                    .cloned()
+                    .ok_or_else(|| PDRouterError::InvalidConfiguration {
+                        reason: format!(
+                            "Missing Mooncake engine_id for encoder-only Prefill {} rank {}",
+                            prefill_base_url, prefill_dp_rank
+                        ),
+                    })?;
+                (prefill_info.bootstrap_addr.clone(), engine_id)
+            };
+
+            let prefill_zmq_addr =
+                self.get_zmq_address(prefill_worker.base_url(), ServiceType::Prefill);
+            let decode_zmq_addr =
+                self.get_zmq_address(decode_worker.base_url(), ServiceType::Decode);
+            let request_id = Self::generate_vllm_request_id(&prefill_zmq_addr, &decode_zmq_addr);
+            let transfer_id =
+                self.generate_transfer_id()
+                    .ok_or_else(|| PDRouterError::InvalidConfiguration {
+                        reason: "Encoder-only Prefill requires Mooncake transfer IDs".to_string(),
+                    })?;
+
+            let decode_base_url = decode_worker.base_url().to_string();
+            let mut prefill_request = Self::prepare_prefill_request(original_request.clone(), path);
+            prefill_request["kv_transfer_params"] = self
+                .build_prefill_kv_transfer_params(
+                    Some(&transfer_id),
+                    Some(&decode_base_url),
+                    decode_worker.dp_rank(),
+                )
+                .map_err(|reason| PDRouterError::InvalidConfiguration { reason })?;
+
+            let mut decode_request = original_request.clone();
+            decode_request["kv_transfer_params"] = self.build_mooncake_decode_kv_transfer_params(
+                &transfer_id,
+                &bootstrap_addr,
+                &engine_id,
+            );
+
+            return Ok(Some((prefill_request, decode_request, request_id)));
+        }
+
         if !matches!(self.kv_connector, KvConnector::Nixl) {
-            return None;
+            return Ok(None);
         }
 
         let prefill_base_url = prefill_worker.base_url().to_string();
         let prefill_dp_rank = prefill_worker.dp_rank();
-        let identity = self.get_nixl_push_identity(&prefill_base_url, prefill_dp_rank)?;
+        let Some(identity) = self.get_nixl_push_identity(&prefill_base_url, prefill_dp_rank) else {
+            return Ok(None);
+        };
 
         let prefill_zmq_addr =
             self.get_zmq_address(prefill_worker.base_url(), ServiceType::Prefill);
@@ -1736,13 +1818,13 @@ impl VllmPDRouter {
         let mut prefill_request = Self::prepare_prefill_request(original_request.clone(), path);
         prefill_request["kv_transfer_params"] = self
             .build_prefill_kv_transfer_params(None, Some(&decode_base_url), decode_worker.dp_rank())
-            .ok()?;
+            .map_err(|reason| PDRouterError::InvalidConfiguration { reason })?;
 
         let mut decode_request = original_request.clone();
         decode_request["kv_transfer_params"] =
             Self::build_nixl_push_decode_params(&identity, &request_id);
 
-        Some((prefill_request, decode_request, request_id))
+        Ok(Some((prefill_request, decode_request, request_id)))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1758,7 +1840,11 @@ impl VllmPDRouter {
         start_time: Instant,
     ) -> Result<Response, PDRouterError> {
         let prefill_base_url = prefill_worker.base_url().to_string();
-        let prefill_dp_rank = prefill_worker.dp_rank();
+        let prefill_dp_rank = if self.encoder_only_prefill {
+            Some(prefill_worker.dp_rank().unwrap_or(0))
+        } else {
+            prefill_worker.dp_rank()
+        };
         let decode_base_url = decode_worker.base_url().to_string();
         let decode_dp_rank = decode_worker.dp_rank();
         let prefill_url = prefill_worker.endpoint_url(path);
@@ -1910,8 +1996,55 @@ impl VllmPDRouter {
         discovery_address: Option<String>,
         ctx: &Arc<crate::server::AppContext>,
     ) -> Result<Self, String> {
+        Self::new_with_options(
+            prefill_urls,
+            decode_urls,
+            discovery_address,
+            VllmPDRouterOptions::default(),
+            ctx,
+        )
+        .await
+    }
+
+    /// Create a vLLM P/D router with optional behavior while preserving the
+    /// original public constructor for existing callers.
+    pub async fn new_with_options(
+        prefill_urls: Vec<(String, Option<u16>)>,
+        decode_urls: Vec<String>,
+        discovery_address: Option<String>,
+        options: VllmPDRouterOptions,
+        ctx: &Arc<crate::server::AppContext>,
+    ) -> Result<Self, String> {
         let kv_connector = ctx.router_config.kv_connector;
         let http_client = reqwest::Client::new();
+
+        if options.encoder_only_prefill {
+            if !matches!(kv_connector, KvConnector::Mooncake) {
+                return Err("Encoder-only Prefill requires --kv-connector mooncake".to_string());
+            }
+            if discovery_address.is_some()
+                || ctx
+                    .router_config
+                    .discovery
+                    .as_ref()
+                    .is_some_and(|config| config.enabled)
+            {
+                return Err(
+                    "Encoder-only Prefill currently requires explicit static URLs".to_string(),
+                );
+            }
+            if prefill_urls.is_empty() || decode_urls.is_empty() {
+                return Err(
+                    "Encoder-only Prefill requires static Prefill and Decode URLs".to_string(),
+                );
+            }
+            if prefill_urls.iter().any(|(_, port)| port.is_none()) {
+                return Err(
+                    "Encoder-only Prefill requires a bootstrap port for every Prefill URL"
+                        .to_string(),
+                );
+            }
+        }
 
         if let Some(ref addr) = discovery_address {
             // Discovery mode
@@ -1949,6 +2082,7 @@ impl VllmPDRouter {
                 intra_node_data_parallel_size: ctx.router_config.intra_node_data_parallel_size,
                 prefill_dp_round_robin: Arc::new(AtomicUsize::new(0)),
                 kv_connector,
+                encoder_only_prefill: options.encoder_only_prefill,
                 mooncake_prefill_info: Arc::new(Mutex::new(HashMap::new())),
                 nixl_prefill_info: RwLock::new(HashMap::new()),
             })
@@ -2006,6 +2140,12 @@ impl VllmPDRouter {
                     );
                     match Self::query_mooncake_bootstrap(&http_client, &bootstrap_addr).await {
                         Ok(dp_engine_ids) => {
+                            if options.encoder_only_prefill && dp_engine_ids.is_empty() {
+                                return Err(format!(
+                                    "Mooncake bootstrap {} returned no engine IDs",
+                                    bootstrap_addr
+                                ));
+                            }
                             info!(
                                 "Got Mooncake engine_ids for {}: {:?}",
                                 base_url, dp_engine_ids
@@ -2039,6 +2179,7 @@ impl VllmPDRouter {
                 intra_node_data_parallel_size: ctx.router_config.intra_node_data_parallel_size,
                 prefill_dp_round_robin: Arc::new(AtomicUsize::new(0)),
                 kv_connector,
+                encoder_only_prefill: options.encoder_only_prefill,
                 mooncake_prefill_info,
                 nixl_prefill_info: RwLock::new(HashMap::new()),
             })
@@ -2943,6 +3084,21 @@ mod tests {
         // Verify the KvConnector::Nixl variant exists and is the default.
         let connector = KvConnector::default();
         assert_eq!(connector, KvConnector::Nixl);
+    }
+
+    #[test]
+    fn test_mooncake_encoder_only_prefill_params_enable_cache_only() {
+        let params = mooncake_prefill_params(Some("xfer-test"), true);
+        assert_eq!(params["do_remote_decode"], true);
+        assert_eq!(params["do_remote_prefill"], false);
+        assert_eq!(params["cache_only"], true);
+        assert_eq!(params["transfer_id"], "xfer-test");
+    }
+
+    #[test]
+    fn test_generic_mooncake_prefill_params_omit_cache_only() {
+        let params = mooncake_prefill_params(Some("xfer-test"), false);
+        assert!(params.get("cache_only").is_none());
     }
 
     // --- MoRI-IO WRITE mode parameter tests ---

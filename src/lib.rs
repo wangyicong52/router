@@ -70,6 +70,7 @@ struct Router {
     request_timeout_secs: u64,
     request_id_headers: Option<Vec<String>>,
     vllm_pd_disaggregation: bool,
+    encoder_only_prefill: bool,
     vllm_discovery_address: Option<String>,
     prefill_urls: Option<Vec<(String, Option<u16>)>>,
     decode_urls: Option<Vec<String>>,
@@ -290,6 +291,7 @@ impl Router {
         request_timeout_secs = 1800,  // Add configurable request timeout
         request_id_headers = None,  // Custom request ID headers
         vllm_pd_disaggregation = false,  // New flag for PD mode
+        encoder_only_prefill = false,
         vllm_discovery_address = None,
         prefill_urls = None,
         decode_urls = None,
@@ -363,6 +365,7 @@ impl Router {
         request_timeout_secs: u64,
         request_id_headers: Option<Vec<String>>,
         vllm_pd_disaggregation: bool,
+        encoder_only_prefill: bool,
         vllm_discovery_address: Option<String>,
         prefill_urls: Option<Vec<(String, Option<u16>)>>,
         decode_urls: Option<Vec<String>>,
@@ -448,6 +451,7 @@ impl Router {
             request_timeout_secs,
             request_id_headers,
             vllm_pd_disaggregation,
+            encoder_only_prefill,
             vllm_discovery_address,
             prefill_urls,
             decode_urls,
@@ -529,29 +533,34 @@ impl Router {
 
         // Block on the async startup function
         runtime.block_on(async move {
-            server::startup(server::ServerConfig {
-                host: self.host.clone(),
-                port: self.port,
-                router_config,
-                max_payload_size: self.max_payload_size,
-                wasm_middleware: self.wasm_middleware.clone(),
-                wasm_middleware_sha256: self.wasm_middleware_sha256.clone(),
-                wasm_middleware_routes: self.wasm_middleware_routes.clone(),
-                log_dir: self.log_dir.clone(),
-                log_level: self.log_level.clone(),
-                service_discovery_config,
-                prometheus_config,
-                request_timeout_secs: self.request_timeout_secs,
-                request_id_headers: self.request_id_headers.clone(),
-                trace_config: if self.enable_trace {
-                    Some(config::TraceConfig {
-                        otlp_traces_endpoint: self.otlp_traces_endpoint.clone(),
-                        ..Default::default()
-                    })
-                } else {
-                    None
+            server::startup_with_options(
+                server::ServerConfig {
+                    host: self.host.clone(),
+                    port: self.port,
+                    router_config,
+                    max_payload_size: self.max_payload_size,
+                    wasm_middleware: self.wasm_middleware.clone(),
+                    wasm_middleware_sha256: self.wasm_middleware_sha256.clone(),
+                    wasm_middleware_routes: self.wasm_middleware_routes.clone(),
+                    log_dir: self.log_dir.clone(),
+                    log_level: self.log_level.clone(),
+                    service_discovery_config,
+                    prometheus_config,
+                    request_timeout_secs: self.request_timeout_secs,
+                    request_id_headers: self.request_id_headers.clone(),
+                    trace_config: if self.enable_trace {
+                        Some(config::TraceConfig {
+                            otlp_traces_endpoint: self.otlp_traces_endpoint.clone(),
+                            ..Default::default()
+                        })
+                    } else {
+                        None
+                    },
                 },
-            })
+                routers::http::vllm_pd_router::VllmPDRouterOptions {
+                    encoder_only_prefill: self.encoder_only_prefill,
+                },
+            )
             .await
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
         })

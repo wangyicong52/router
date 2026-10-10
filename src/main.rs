@@ -6,6 +6,7 @@ use vllm_router_rs::config::{
     ProgramSchedulingConfig, RetryConfig, RouterConfig, RoutingMode, TraceConfig,
 };
 use vllm_router_rs::metrics::PrometheusConfig;
+use vllm_router_rs::routers::http::vllm_pd_router::VllmPDRouterOptions;
 use vllm_router_rs::server::{self, ServerConfig};
 use vllm_router_rs::service_discovery::ServiceDiscoveryConfig;
 
@@ -133,6 +134,11 @@ struct CliArgs {
     /// Enable vLLM PD (Prefill-Decode) disaggregated mode with vLLM-specific two-stage processing
     #[arg(long, default_value_t = false)]
     vllm_pd_disaggregation: bool,
+
+    /// Run Mooncake Prefill as a cache-only encoder concurrently with Decode.
+    /// Requires static --prefill/--decode URLs and explicit Prefill bootstrap ports.
+    #[arg(long, default_value_t = false)]
+    encoder_only_prefill: bool,
 
     /// ZMQ service discovery address for vLLM P2P NCCL coordination (e.g., "0.0.0.0:30001")
     /// Required for --vllm-pd-disaggregation mode. Workers register their HTTP and ZMQ addresses here.
@@ -743,7 +749,13 @@ Provide --worker-urls or PD flags as usual.",
     // Block on the async startup function
     println!("DEBUG: Starting server startup function");
     runtime.block_on(async move {
-        let result = server::startup(server_config).await;
+        let result = server::startup_with_options(
+            server_config,
+            VllmPDRouterOptions {
+                encoder_only_prefill: cli_args.encoder_only_prefill,
+            },
+        )
+        .await;
         // Shut down OTel while the Tokio runtime is still alive so the
         // BatchSpanProcessor can flush its final batch.
         if vllm_router_rs::otel_trace::is_otel_enabled() {
@@ -758,6 +770,22 @@ Provide --worker-urls or PD flags as usual.",
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_encoder_only_prefill_flag() {
+        let args = CliArgs::try_parse_from([
+            "vllm-router",
+            "--vllm-pd-disaggregation",
+            "--encoder-only-prefill",
+            "--kv-connector",
+            "mooncake",
+        ])
+        .unwrap();
+
+        assert!(args.vllm_pd_disaggregation);
+        assert!(args.encoder_only_prefill);
+        assert_eq!(args.kv_connector, KvConnector::Mooncake);
+    }
 
     #[test]
     fn parses_wasm_middleware_options() {
