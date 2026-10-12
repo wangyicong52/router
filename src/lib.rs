@@ -189,6 +189,7 @@ impl Router {
         };
 
         Ok(config::RouterConfig {
+            epd: None,
             mode,
             policy,
             host: self.host.clone(),
@@ -547,6 +548,7 @@ impl Router {
                     service_discovery_config,
                     prometheus_config,
                     request_timeout_secs: self.request_timeout_secs,
+                    pool_idle_timeout_secs: server::DEFAULT_POOL_IDLE_TIMEOUT_SECS,
                     request_id_headers: self.request_id_headers.clone(),
                     trace_config: if self.enable_trace {
                         Some(config::TraceConfig {
